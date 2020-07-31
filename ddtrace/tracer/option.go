@@ -30,6 +30,9 @@ type config struct {
 	// debug, when true, writes details to logs.
 	debug bool
 
+	// lambda, when true, enables the lambda trace handler
+	lambda bool
+
 	// logStartup, when true, causes various startup info to be written
 	// when the tracer starts.
 	logStartup bool
@@ -245,6 +248,13 @@ func WithPrioritySampling() StartOption {
 func WithDebugMode(enabled bool) StartOption {
 	return func(c *config) {
 		c.debug = enabled
+	}
+}
+
+// WithLambdaMode enables lambda mode on the tracer, for use with amazon lambda.
+func WithLambdaMode(enabled bool) StartOption {
+	return func(c *config) {
+		c.lambda = enabled
 	}
 }
 

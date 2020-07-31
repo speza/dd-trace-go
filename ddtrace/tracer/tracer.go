@@ -29,13 +29,13 @@ var _ ddtrace.Tracer = (*tracer)(nil)
 // queues to be processed by the payload encoder.
 type tracer struct {
 	*config
-	*payload
+
+	// traceHandler is responsible for sending finished traces to their
+	// destination, such as the trace agent or lambda handler.
+	traceHandler
 
 	// payloadChan receives traces to be added to the payload.
 	payloadChan chan []*span
-
-	// climit limits the number of concurrent outgoing connections
-	climit chan struct{}
 
 	// stop causes the tracer to shut down when closed.
 	stop chan struct{}
@@ -45,9 +45,6 @@ type tracer struct {
 
 	// wg waits for all goroutines to exit when stopping.
 	wg sync.WaitGroup
-
-	// prioritySampling holds an instance of the priority sampler.
-	prioritySampling *prioritySampler
 
 	// pid of the process
 	pid string
@@ -141,16 +138,28 @@ func newUnstartedTracer(opts ...StartOption) *tracer {
 	if envRules != nil {
 		c.samplingRules = envRules
 	}
-	return &tracer{
-		config:           c,
-		payload:          newPayload(),
-		payloadChan:      make(chan []*span, payloadQueueSize),
-		stop:             make(chan struct{}),
-		rulesSampling:    newRulesSampler(c.samplingRules),
-		climit:           make(chan struct{}, concurrentConnectionLimit),
-		prioritySampling: newPrioritySampler(),
-		pid:              strconv.Itoa(os.Getpid()),
+	t := &tracer{
+		config:        c,
+		payloadChan:   make(chan []*span, payloadQueueSize),
+		stop:          make(chan struct{}),
+		rulesSampling: newRulesSampler(c.samplingRules),
+		pid:           strconv.Itoa(os.Getpid()),
 	}
+	if t.config.lambda {
+		t.traceHandler = &lambdaTraceHandler{
+			statsd: t.config.statsd,
+		}
+	} else {
+		t.traceHandler = &agentTraceHandler{
+			payload:          newPayload(),
+			statsd:           t.config.statsd,
+			climit:           make(chan struct{}, concurrentConnectionLimit),
+			transport:        t.config.transport,
+			prioritySampling: newPrioritySampler(),
+		}
+	}
+
+	return t
 }
 
 func newTracer(opts ...StartOption) *tracer {
@@ -185,19 +194,17 @@ func newTracer(opts ...StartOption) *tracer {
 	return t
 }
 
-// worker receives finished traces to be added into the payload, as well
-// as periodically flushes traces to the transport.
 func (t *tracer) worker(tick <-chan time.Time) {
 	defer t.config.statsd.Close()
 
 	for {
 		select {
 		case trace := <-t.payloadChan:
-			t.pushPayload(trace)
+			t.traceHandler.pushPayload(trace)
 
 		case <-tick:
 			t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:scheduled"}, 1)
-			t.flush()
+			t.traceHandler.flush()
 
 		case <-t.stop:
 		loop:
@@ -206,13 +213,13 @@ func (t *tracer) worker(tick <-chan time.Time) {
 			for {
 				select {
 				case trace := <-t.payloadChan:
-					t.pushPayload(trace)
+					t.traceHandler.pushPayload(trace)
 				default:
 					break loop
 				}
 			}
 			t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:shutdown"}, 1)
-			t.flush()
+			t.traceHandler.flush()
 			t.config.statsd.Incr("datadog.tracer.stopped", nil, 1)
 			return
 		}
@@ -324,6 +331,7 @@ func (t *tracer) Stop() {
 		close(t.stop)
 	})
 	t.wg.Wait()
+	t.traceHandler.wait()
 }
 
 // Inject uses the configured or default TextMap Propagator.
@@ -334,49 +342,6 @@ func (t *tracer) Inject(ctx ddtrace.SpanContext, carrier interface{}) error {
 // Extract uses the configured or default TextMap Propagator.
 func (t *tracer) Extract(carrier interface{}) (ddtrace.SpanContext, error) {
 	return t.config.propagator.Extract(carrier)
-}
-
-// flush will push any currently buffered traces to the server.
-func (t *tracer) flush() {
-	if t.payload.itemCount() == 0 {
-		return
-	}
-	t.wg.Add(1)
-	t.climit <- struct{}{}
-	go func(p *payload) {
-		defer func(start time.Time) {
-			<-t.climit
-			t.wg.Done()
-			t.config.statsd.Timing("datadog.tracer.flush_duration", time.Since(start), nil, 1)
-		}(time.Now())
-		size, count := p.size(), p.itemCount()
-		log.Debug("Sending payload: size: %d traces: %d\n", size, count)
-		rc, err := t.config.transport.send(p)
-		if err != nil {
-			t.config.statsd.Count("datadog.tracer.traces_dropped", int64(count), []string{"reason:send_failed"}, 1)
-			log.Error("lost %d traces: %v", count, err)
-		} else {
-			t.config.statsd.Count("datadog.tracer.flush_bytes", int64(size), nil, 1)
-			t.config.statsd.Count("datadog.tracer.flush_traces", int64(count), nil, 1)
-			if err := t.prioritySampling.readRatesJSON(rc); err != nil {
-				t.config.statsd.Incr("datadog.tracer.decode_error", nil, 1)
-			}
-		}
-	}(t.payload)
-	t.payload = newPayload()
-}
-
-// pushPayload pushes the trace onto the payload. If the payload becomes
-// larger than the threshold as a result, it sends a flush request.
-func (t *tracer) pushPayload(trace []*span) {
-	if err := t.payload.push(trace); err != nil {
-		t.config.statsd.Incr("datadog.tracer.traces_dropped", []string{"reason:encoding_error"}, 1)
-		log.Error("error encoding msgpack: %v", err)
-	}
-	if t.payload.size() > payloadSizeLimit {
-		t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:size"}, 1)
-		t.flush()
-	}
 }
 
 // sampleRateMetricKey is the metric key holding the applied sample rate. Has to be the same as the Agent.
@@ -399,5 +364,5 @@ func (t *tracer) sample(span *span) {
 	if t.rulesSampling.apply(span) {
 		return
 	}
-	t.prioritySampling.apply(span)
+	t.traceHandler.sample(span)
 }
