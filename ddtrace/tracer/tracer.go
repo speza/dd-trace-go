@@ -147,14 +147,13 @@ func newUnstartedTracer(opts ...StartOption) *tracer {
 	}
 	if t.config.lambda {
 		t.traceHandler = &lambdaTraceHandler{
-			statsd: t.config.statsd,
+			config: t.config,
 		}
 	} else {
 		t.traceHandler = &agentTraceHandler{
+			config:           t.config,
 			payload:          newPayload(),
-			statsd:           t.config.statsd,
 			climit:           make(chan struct{}, concurrentConnectionLimit),
-			transport:        t.config.transport,
 			prioritySampling: newPrioritySampler(),
 		}
 	}
