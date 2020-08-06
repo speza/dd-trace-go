@@ -527,8 +527,8 @@ func BenchmarkRulesSampler(b *testing.B) {
 				spans[j].Finish()
 			}
 			d := 0
-			for len(t.payloadChan) > 0 {
-				<-t.payloadChan
+			for len(t.out) > 0 {
+				<-t.out
 				d++
 			}
 		}

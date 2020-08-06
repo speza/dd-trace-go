@@ -6,6 +6,7 @@
 package tracer
 
 import (
+	"bytes"
 	"encoding/json"
 	"strconv"
 	"sync"
@@ -15,6 +16,13 @@ import (
 )
 
 type traceWriter interface {
+	// add adds a trace to the current payload being constructed by the handler.
+	add([]*span)
+
+	// flush causes the handler to send its current payload. The flush can happen asynchronously, but
+	// the handler must be ready to accept new traces with add when flush returns.
+	flush()
+
 	// stop shuts down the traceWriter, ensuring all payloads are flushed.
 	stop()
 }
@@ -32,60 +40,16 @@ type agentTraceWriter struct {
 
 	// prioritySampling refers to the tracer's priority sampler.
 	prioritySampling *prioritySampler
-
-	// stopChan gets closed when stop() is called
-	stopChan chan struct{}
-
-	// traceChan receives traces to be added to the payload.
-	traceChan chan []*span
 }
 
 var _ traceWriter = &agentTraceWriter{}
 
-func newAgentTraceWriter(c *config, s *prioritySampler, traceChan chan []*span) *agentTraceWriter {
-	atw := &agentTraceWriter{
+func newAgentTraceWriter(c *config, s *prioritySampler) *agentTraceWriter {
+	return &agentTraceWriter{
 		config:           c,
 		payload:          newPayload(),
 		climit:           make(chan struct{}, concurrentConnectionLimit),
 		prioritySampling: s,
-		stopChan:         make(chan struct{}, 1),
-		traceChan:        traceChan,
-	}
-	go atw.run()
-	atw.wg.Add(1)
-	return atw
-}
-
-func (h *agentTraceWriter) run() {
-	defer h.wg.Done()
-	tick := h.config.tickChan
-	if tick == nil {
-		ticker := time.NewTicker(flushInterval)
-		tick = ticker.C
-	}
-	for {
-		select {
-		case trace := <-h.traceChan:
-			h.add(trace)
-		case <-tick:
-			h.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:scheduled"}, 1)
-			h.flush()
-		case <-h.stopChan:
-		loop:
-			// the loop ensures that the payload channel is fully drained
-			// before the final flush to ensure no traces are lost (see #526)
-			for {
-				select {
-				case trace := <-h.traceChan:
-					h.add(trace)
-				default:
-					break loop
-				}
-			}
-			h.flush()
-			h.config.statsd.Incr("datadog.tracer.stopped", nil, 1)
-			return
-		}
 	}
 }
 
@@ -101,11 +65,6 @@ func (h *agentTraceWriter) add(trace []*span) {
 }
 
 func (h *agentTraceWriter) stop() {
-	h.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:shutdown"}, 1)
-	select {
-	case h.stopChan <- struct{}{}:
-	default:
-	}
 	h.wg.Wait()
 }
 
@@ -163,104 +122,113 @@ type jsonPayload struct {
 }
 
 type lambdaTraceWriter struct {
-	config  *config
-	payload jsonPayload
-
-	// wg waits for all goroutines to exit when stopping.
-	wg sync.WaitGroup
-
-	// stopChan gets closed when stop() is called
-	stopChan chan struct{}
-
-	// traceChan receives traces to be added to the payload.
-	traceChan chan []*span
+	config *config
+	//payload jsonPayload
+	payload bytes.Buffer
+	traces  int
 }
 
 var _ traceWriter = &lambdaTraceWriter{}
 
-func newLambdaTraceWriter(c *config, traceChan chan []*span) *lambdaTraceWriter {
-	ltw := &lambdaTraceWriter{
-		config:    c,
-		stopChan:  make(chan struct{}, 1),
-		traceChan: traceChan,
+func newLambdaTraceWriter(c *config) *lambdaTraceWriter {
+	w := &lambdaTraceWriter{
+		config: c,
 	}
-
-	go ltw.run()
-	ltw.wg.Add(1)
-	return ltw
+	w.newPayload()
+	return w
 }
 
-func (h *lambdaTraceWriter) run() {
-	defer h.wg.Done()
-	tick := h.config.tickChan
-	if tick == nil {
-		ticker := time.NewTicker(flushInterval)
-		tick = ticker.C
+const payloadLimit = 256 * 1024 // log line limit for cloudwatch
+//const payloadLimit = 400
+
+func (h *lambdaTraceWriter) newPayload() {
+	h.payload.Reset()
+	h.payload.Write([]byte(`{"traces": [`))
+	h.traces = 0
+}
+
+func (h *lambdaTraceWriter) addSpan(s *span) error {
+	js := jsonSpan{
+		TraceID:  hexInt(s.TraceID),
+		SpanID:   hexInt(s.SpanID),
+		ParentID: hexInt(s.ParentID),
+		Name:     s.Name,
+		Resource: s.Resource,
+		Error:    s.Error,
+		Meta:     s.Meta,
+		Metrics:  s.Metrics,
+		Start:    s.Start,
+		Duration: s.Duration,
+		Service:  s.Service,
 	}
-	for {
-		select {
-		case trace := <-h.traceChan:
-			h.add(trace)
-		case <-tick:
-			h.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:scheduled"}, 1)
-			h.flush()
-		case <-h.stopChan:
-		loop:
-			// the loop ensures that the payload channel is fully drained
-			// before the final flush to ensure no traces are lost (see #526)
-			for {
-				select {
-				case trace := <-h.traceChan:
-					h.add(trace)
-				default:
-					break loop
-				}
-			}
-			h.flush()
-			h.config.statsd.Incr("datadog.tracer.stopped", nil, 1)
-			return
-		}
+	e := json.NewEncoder(&h.payload)
+	err := e.Encode(js)
+	if err != nil {
+		return err
 	}
+	return nil
 }
 
 func (h *lambdaTraceWriter) add(trace []*span) {
-	js := make([]jsonSpan, len(trace))
+	startLen := h.payload.Len()
+
+	if h.traces == 0 {
+		h.payload.Write([]byte("["))
+	} else {
+		h.payload.Write([]byte(", ["))
+	}
+
 	for i, s := range trace {
-		js[i] = jsonSpan{
-			TraceID:  hexInt(s.TraceID),
-			SpanID:   hexInt(s.SpanID),
-			ParentID: hexInt(s.ParentID),
-			Name:     s.Name,
-			Resource: s.Resource,
-			Error:    s.Error,
-			Meta:     s.Meta,
-			Metrics:  s.Metrics,
-			Start:    s.Start,
-			Duration: s.Duration,
-			Service:  s.Service,
+		l := h.payload.Len()
+		if i != 0 {
+			h.payload.WriteByte(',')
+		}
+		err := h.addSpan(s)
+		if err != nil {
+			h.config.statsd.Count("datadog.tracer.traces_dropped", 1, []string{"reason:encoding_failed"}, 1)
+			log.Error("lost a trace: %v", err)
+			h.payload.Truncate(startLen)
+			return
+		}
+
+		if h.payload.Len() > payloadLimit-2 {
+			if i == 0 {
+				h.payload.Truncate(startLen)
+				h.flush()
+			} else {
+				h.payload.Truncate(l)
+				h.payload.Write([]byte("]"))
+				h.flush()
+			}
+			h.payload.Write([]byte("["))
+			err := h.addSpan(s)
+			if err != nil {
+				h.config.statsd.Count("datadog.tracer.traces_dropped", 1, []string{"reason:encoding_failed"}, 1)
+				log.Error("lost a trace: %v", err)
+				h.payload.Truncate(startLen)
+				return
+			}
+			if h.payload.Len() > payloadLimit-2 {
+				// Single span is too big. Let's dump the trace.
+				h.config.statsd.Count("datadog.tracer.traces_dropped", 1, []string{"reason:encoding_failed"}, 1)
+				log.Error("lost a trace: span too large for payload")
+				h.payload.Truncate(startLen)
+				return
+			}
 		}
 	}
-	h.payload.Traces = append(h.payload.Traces, js)
+	h.payload.Write([]byte("]"))
+	h.traces++
 }
 
-func (h *lambdaTraceWriter) stop() {
-	h.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:shutdown"}, 1)
-	select {
-	case h.stopChan <- struct{}{}:
-	default:
-	}
-	h.wg.Wait()
-}
+func (h *lambdaTraceWriter) stop() {}
 
 // flush will push any currently buffered traces to the server.
 func (h *lambdaTraceWriter) flush() {
-	bs, err := json.Marshal(h.payload)
-	if err != nil {
-		h.config.statsd.Count("datadog.tracer.traces_dropped", int64(len(h.payload.Traces)), []string{"reason:encoding_failed"}, 1)
-		log.Error("lost %d traces: %v", len(h.payload.Traces), err)
-		h.payload.Traces = h.payload.Traces[:0]
-		return
-	}
-	h.payload.Traces = h.payload.Traces[:0]
-	log.Info("%s", string(bs))
+	// 	if h.traces == 0 {
+	// 		return
+	// 	}
+	h.payload.Write([]byte("]}"))
+	log.Info("%s", h.payload.String())
+	h.newPayload()
 }

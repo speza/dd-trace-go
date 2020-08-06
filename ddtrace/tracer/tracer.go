@@ -34,8 +34,8 @@ type tracer struct {
 	// destination, such as the trace agent or lambda handler.
 	traceWriter
 
-	// payloadChan receives traces to be added to the payload.
-	payloadChan chan []*span
+	// out receives traces to be added to the payload.
+	out chan []*span
 
 	// stop causes the tracer to shut down when closed.
 	stop chan struct{}
@@ -143,7 +143,7 @@ func newUnstartedTracer(opts ...StartOption) *tracer {
 	}
 	t := &tracer{
 		config:           c,
-		payloadChan:      make(chan []*span, payloadQueueSize),
+		out:              make(chan []*span, payloadQueueSize),
 		stop:             make(chan struct{}),
 		rulesSampling:    newRulesSampler(c.samplingRules),
 		prioritySampling: newPrioritySampler(),
@@ -157,9 +157,9 @@ func newTracer(opts ...StartOption) *tracer {
 	c := t.config
 	t.config.statsd.Incr("datadog.tracer.started", nil, 1)
 	if t.config.lambda {
-		t.traceWriter = newLambdaTraceWriter(c, t.payloadChan)
+		t.traceWriter = newLambdaTraceWriter(c)
 	} else {
-		t.traceWriter = newAgentTraceWriter(t.config, t.prioritySampling, t.payloadChan)
+		t.traceWriter = newAgentTraceWriter(t.config, t.prioritySampling)
 	}
 	if c.runtimeMetrics {
 		log.Debug("Runtime metrics enabled.")
@@ -173,9 +173,55 @@ func newTracer(opts ...StartOption) *tracer {
 	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
+		tick := t.config.tickChan
+		if tick == nil {
+			ticker := time.NewTicker(flushInterval)
+			defer ticker.Stop()
+			tick = ticker.C
+		}
+		t.worker(tick)
+	}()
+
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
 		t.reportHealthMetrics(statsInterval)
 	}()
 	return t
+}
+
+// worker receives finished traces to be added into the payload, as well
+// as periodically flushes traces to the transport.
+func (t *tracer) worker(tick <-chan time.Time) {
+	defer t.config.statsd.Close()
+
+	for {
+		select {
+		case trace := <-t.out:
+			t.traceWriter.add(trace)
+
+		case <-tick:
+			t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:scheduled"}, 1)
+			t.traceWriter.flush()
+
+		case <-t.stop:
+		loop:
+			// the loop ensures that the payload channel is fully drained
+			// before the final flush to ensure no traces are lost (see #526)
+			for {
+				select {
+				case trace := <-t.out:
+					t.traceWriter.add(trace)
+				default:
+					break loop
+				}
+			}
+			t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:shutdown"}, 1)
+			t.traceWriter.flush()
+			t.config.statsd.Incr("datadog.tracer.stopped", nil, 1)
+			return
+		}
+	}
 }
 
 func (t *tracer) pushTrace(trace []*span) {
@@ -185,7 +231,7 @@ func (t *tracer) pushTrace(trace []*span) {
 	default:
 	}
 	select {
-	case t.payloadChan <- trace:
+	case t.out <- trace:
 	default:
 		log.Error("payload queue full, dropping %d traces", len(trace))
 	}

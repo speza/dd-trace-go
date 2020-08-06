@@ -943,16 +943,16 @@ func TestPushTrace(t *testing.T) {
 	}
 	tracer.pushTrace(trace)
 
-	assert.Len(tracer.payloadChan, 1)
+	assert.Len(tracer.out, 1)
 
-	t0 := <-tracer.payloadChan
+	t0 := <-tracer.out
 	assert.Equal(trace, t0)
 
 	many := payloadQueueSize + 2
 	for i := 0; i < many; i++ {
 		tracer.pushTrace(make([]*span, i))
 	}
-	assert.Len(tracer.payloadChan, payloadQueueSize)
+	assert.Len(tracer.out, payloadQueueSize)
 	log.Flush()
 	assert.True(len(tp.Lines()) >= 2)
 }
