@@ -7,30 +7,19 @@ package tracer
 
 import (
 	"encoding/json"
-	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/log"
 )
 
-type traceHandler interface {
-	// pushPayload adds a trace to the current payload being constructed by the handler.
-	pushPayload([]*span)
-
-	// flush should cause the handler to send its current payload. The flush can happen asynchronously, but
-	// the handler must be ready to accept new traces with pushPayload when flush() returns.
-	flush()
-
-	// wait will pause until the traceHandler is finished any asynchronous tasks it is performing.
-	wait()
-
-	// sample gives a handler the opportunity to perform sampling on a span. This is called when a span
-	// is created.
-	sample(*span)
+type traceWriter interface {
+	// stop shuts down the traceWriter, ensuring all payloads are flushed.
+	stop()
 }
 
-type agentTraceHandler struct {
+type agentTraceWriter struct {
 	config *config
 
 	payload *payload
@@ -43,11 +32,64 @@ type agentTraceHandler struct {
 
 	// prioritySampling refers to the tracer's priority sampler.
 	prioritySampling *prioritySampler
+
+	// stopChan gets closed when stop() is called
+	stopChan chan struct{}
+
+	// traceChan receives traces to be added to the payload.
+	traceChan chan []*span
 }
 
-var _ traceHandler = &agentTraceHandler{}
+var _ traceWriter = &agentTraceWriter{}
 
-func (h *agentTraceHandler) pushPayload(trace []*span) {
+func newAgentTraceWriter(c *config, s *prioritySampler, traceChan chan []*span) *agentTraceWriter {
+	atw := &agentTraceWriter{
+		config:           c,
+		payload:          newPayload(),
+		climit:           make(chan struct{}, concurrentConnectionLimit),
+		prioritySampling: s,
+		stopChan:         make(chan struct{}, 1),
+		traceChan:        traceChan,
+	}
+	go atw.run()
+	atw.wg.Add(1)
+	return atw
+}
+
+func (h *agentTraceWriter) run() {
+	defer h.wg.Done()
+	tick := h.config.tickChan
+	if tick == nil {
+		ticker := time.NewTicker(flushInterval)
+		tick = ticker.C
+	}
+	for {
+		select {
+		case trace := <-h.traceChan:
+			h.add(trace)
+		case <-tick:
+			h.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:scheduled"}, 1)
+			h.flush()
+		case <-h.stopChan:
+		loop:
+			// the loop ensures that the payload channel is fully drained
+			// before the final flush to ensure no traces are lost (see #526)
+			for {
+				select {
+				case trace := <-h.traceChan:
+					h.add(trace)
+				default:
+					break loop
+				}
+			}
+			h.flush()
+			h.config.statsd.Incr("datadog.tracer.stopped", nil, 1)
+			return
+		}
+	}
+}
+
+func (h *agentTraceWriter) add(trace []*span) {
 	if err := h.payload.push(trace); err != nil {
 		h.config.statsd.Incr("datadog.tracer.traces_dropped", []string{"reason:encoding_error"}, 1)
 		log.Error("error encoding msgpack: %v", err)
@@ -58,8 +100,17 @@ func (h *agentTraceHandler) pushPayload(trace []*span) {
 	}
 }
 
+func (h *agentTraceWriter) stop() {
+	h.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:shutdown"}, 1)
+	select {
+	case h.stopChan <- struct{}{}:
+	default:
+	}
+	h.wg.Wait()
+}
+
 // flush will push any currently buffered traces to the server.
-func (h *agentTraceHandler) flush() {
+func (h *agentTraceWriter) flush() {
 	if h.payload.itemCount() == 0 {
 		return
 	}
@@ -88,18 +139,10 @@ func (h *agentTraceHandler) flush() {
 	h.payload = newPayload()
 }
 
-func (h *agentTraceHandler) sample(s *span) {
-	h.prioritySampling.apply(s)
-}
-
-func (h *agentTraceHandler) wait() {
-	h.wg.Wait()
-}
-
 type hexInt uint64
 
 func (i hexInt) MarshalJSON() ([]byte, error) {
-	return []byte(fmt.Sprintf(`"%X"`, i)), nil
+	return []byte(`"` + strconv.FormatUint(uint64(i), 16) + `"`), nil
 }
 
 type jsonSpan struct {
@@ -119,15 +162,68 @@ type jsonPayload struct {
 	Traces [][]jsonSpan `json:"traces"`
 }
 
-type lambdaTraceHandler struct {
+type lambdaTraceWriter struct {
 	config  *config
 	payload jsonPayload
+
+	// wg waits for all goroutines to exit when stopping.
+	wg sync.WaitGroup
+
+	// stopChan gets closed when stop() is called
+	stopChan chan struct{}
+
+	// traceChan receives traces to be added to the payload.
+	traceChan chan []*span
 }
 
-var _ traceHandler = &lambdaTraceHandler{}
+var _ traceWriter = &lambdaTraceWriter{}
 
-func (h *lambdaTraceHandler) pushPayload(trace []*span) {
-	log.Info("PUSHING PAYLOAD WITH %d SPANS", len(trace))
+func newLambdaTraceWriter(c *config, traceChan chan []*span) *lambdaTraceWriter {
+	ltw := &lambdaTraceWriter{
+		config:    c,
+		stopChan:  make(chan struct{}, 1),
+		traceChan: traceChan,
+	}
+
+	go ltw.run()
+	ltw.wg.Add(1)
+	return ltw
+}
+
+func (h *lambdaTraceWriter) run() {
+	defer h.wg.Done()
+	tick := h.config.tickChan
+	if tick == nil {
+		ticker := time.NewTicker(flushInterval)
+		tick = ticker.C
+	}
+	for {
+		select {
+		case trace := <-h.traceChan:
+			h.add(trace)
+		case <-tick:
+			h.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:scheduled"}, 1)
+			h.flush()
+		case <-h.stopChan:
+		loop:
+			// the loop ensures that the payload channel is fully drained
+			// before the final flush to ensure no traces are lost (see #526)
+			for {
+				select {
+				case trace := <-h.traceChan:
+					h.add(trace)
+				default:
+					break loop
+				}
+			}
+			h.flush()
+			h.config.statsd.Incr("datadog.tracer.stopped", nil, 1)
+			return
+		}
+	}
+}
+
+func (h *lambdaTraceWriter) add(trace []*span) {
 	js := make([]jsonSpan, len(trace))
 	for i, s := range trace {
 		js[i] = jsonSpan{
@@ -147,11 +243,18 @@ func (h *lambdaTraceHandler) pushPayload(trace []*span) {
 	h.payload.Traces = append(h.payload.Traces, js)
 }
 
-// flush will push any currently buffered traces to the server.
-func (h *lambdaTraceHandler) flush() {
-	log.Info("MARSHALING PAYLOAD WITH %d SPANS", len(h.payload.Traces))
-	bs, err := json.Marshal(h.payload)
+func (h *lambdaTraceWriter) stop() {
+	h.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:shutdown"}, 1)
+	select {
+	case h.stopChan <- struct{}{}:
+	default:
+	}
+	h.wg.Wait()
+}
 
+// flush will push any currently buffered traces to the server.
+func (h *lambdaTraceWriter) flush() {
+	bs, err := json.Marshal(h.payload)
 	if err != nil {
 		h.config.statsd.Count("datadog.tracer.traces_dropped", int64(len(h.payload.Traces)), []string{"reason:encoding_failed"}, 1)
 		log.Error("lost %d traces: %v", len(h.payload.Traces), err)
@@ -161,7 +264,3 @@ func (h *lambdaTraceHandler) flush() {
 	h.payload.Traces = h.payload.Traces[:0]
 	log.Info("%s", string(bs))
 }
-
-func (h *lambdaTraceHandler) sample(*span) {}
-
-func (h *lambdaTraceHandler) wait() {}

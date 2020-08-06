@@ -32,7 +32,7 @@ type tracer struct {
 
 	// traceHandler is responsible for sending finished traces to their
 	// destination, such as the trace agent or lambda handler.
-	traceHandler
+	traceWriter
 
 	// payloadChan receives traces to be added to the payload.
 	payloadChan chan []*span
@@ -45,6 +45,9 @@ type tracer struct {
 
 	// wg waits for all goroutines to exit when stopping.
 	wg sync.WaitGroup
+
+	// prioritySampling holds an instance of the priority sampler.
+	prioritySampling *prioritySampler
 
 	// pid of the process
 	pid string
@@ -139,25 +142,13 @@ func newUnstartedTracer(opts ...StartOption) *tracer {
 		c.samplingRules = envRules
 	}
 	t := &tracer{
-		config:        c,
-		payloadChan:   make(chan []*span, payloadQueueSize),
-		stop:          make(chan struct{}),
-		rulesSampling: newRulesSampler(c.samplingRules),
-		pid:           strconv.Itoa(os.Getpid()),
+		config:           c,
+		payloadChan:      make(chan []*span, payloadQueueSize),
+		stop:             make(chan struct{}),
+		rulesSampling:    newRulesSampler(c.samplingRules),
+		prioritySampling: newPrioritySampler(),
+		pid:              strconv.Itoa(os.Getpid()),
 	}
-	if t.config.lambda {
-		t.traceHandler = &lambdaTraceHandler{
-			config: t.config,
-		}
-	} else {
-		t.traceHandler = &agentTraceHandler{
-			config:           t.config,
-			payload:          newPayload(),
-			climit:           make(chan struct{}, concurrentConnectionLimit),
-			prioritySampling: newPrioritySampler(),
-		}
-	}
-
 	return t
 }
 
@@ -165,6 +156,11 @@ func newTracer(opts ...StartOption) *tracer {
 	t := newUnstartedTracer(opts...)
 	c := t.config
 	t.config.statsd.Incr("datadog.tracer.started", nil, 1)
+	if t.config.lambda {
+		t.traceWriter = newLambdaTraceWriter(c, t.payloadChan)
+	} else {
+		t.traceWriter = newAgentTraceWriter(t.config, t.prioritySampling, t.payloadChan)
+	}
 	if c.runtimeMetrics {
 		log.Debug("Runtime metrics enabled.")
 		t.wg.Add(1)
@@ -173,17 +169,6 @@ func newTracer(opts ...StartOption) *tracer {
 			t.reportRuntimeMetrics(defaultMetricsReportInterval)
 		}()
 	}
-	t.wg.Add(1)
-	go func() {
-		defer t.wg.Done()
-		tick := t.config.tickChan
-		if tick == nil {
-			ticker := time.NewTicker(flushInterval)
-			defer ticker.Stop()
-			tick = ticker.C
-		}
-		t.worker(tick)
-	}()
 
 	t.wg.Add(1)
 	go func() {
@@ -191,38 +176,6 @@ func newTracer(opts ...StartOption) *tracer {
 		t.reportHealthMetrics(statsInterval)
 	}()
 	return t
-}
-
-func (t *tracer) worker(tick <-chan time.Time) {
-	defer t.config.statsd.Close()
-
-	for {
-		select {
-		case trace := <-t.payloadChan:
-			t.traceHandler.pushPayload(trace)
-
-		case <-tick:
-			t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:scheduled"}, 1)
-			t.traceHandler.flush()
-
-		case <-t.stop:
-		loop:
-			// the loop ensures that the payload channel is fully drained
-			// before the final flush to ensure no traces are lost (see #526)
-			for {
-				select {
-				case trace := <-t.payloadChan:
-					t.traceHandler.pushPayload(trace)
-				default:
-					break loop
-				}
-			}
-			t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:shutdown"}, 1)
-			t.traceHandler.flush()
-			t.config.statsd.Incr("datadog.tracer.stopped", nil, 1)
-			return
-		}
-	}
 }
 
 func (t *tracer) pushTrace(trace []*span) {
@@ -330,7 +283,8 @@ func (t *tracer) Stop() {
 		close(t.stop)
 	})
 	t.wg.Wait()
-	t.traceHandler.wait()
+	t.traceWriter.stop()
+	t.config.statsd.Close()
 }
 
 // Inject uses the configured or default TextMap Propagator.
@@ -363,5 +317,5 @@ func (t *tracer) sample(span *span) {
 	if t.rulesSampling.apply(span) {
 		return
 	}
-	t.traceHandler.sample(span)
+	t.prioritySampling.apply(span)
 }
