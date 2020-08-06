@@ -8,6 +8,7 @@ package tracer
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"sync"
 	"time"
@@ -117,13 +118,9 @@ type jsonSpan struct {
 	Duration int64              `json:"duration"`
 	Service  string             `json:"service"`
 }
-type jsonPayload struct {
-	Traces [][]jsonSpan `json:"traces"`
-}
 
 type lambdaTraceWriter struct {
-	config *config
-	//payload jsonPayload
+	config    *config
 	payload   bytes.Buffer
 	hasTraces bool
 }
@@ -138,10 +135,7 @@ func newLambdaTraceWriter(c *config) *lambdaTraceWriter {
 	return w
 }
 
-// const payloadLimit = 256 * 1024 // log line limit for cloudwatch
-const payloadLimit = 400
-
-//const payloadLimit = 100
+const payloadLimit = 256 * 1024 // log line limit for cloudwatch
 
 func (h *lambdaTraceWriter) newPayload() {
 	h.payload.Reset()
@@ -173,14 +167,19 @@ func (h *lambdaTraceWriter) addSpan(s *span) error {
 	return nil
 }
 
-func (h *lambdaTraceWriter) add(trace []*span) {
+type encodingError struct {
+	cause      error
+	dropReason string
+}
+
+func (h *lambdaTraceWriter) addTrace(trace []*span) (int, *encodingError) {
 	startLen := h.payload.Len()
 	if !h.hasTraces {
 		h.payload.Write([]byte("["))
 	} else {
 		h.payload.Write([]byte(", ["))
 	}
-
+	written := 0
 	for i, s := range trace {
 		l := h.payload.Len()
 		if i != 0 {
@@ -188,35 +187,38 @@ func (h *lambdaTraceWriter) add(trace []*span) {
 		}
 		err := h.addSpan(s)
 		if err != nil {
-			h.config.statsd.Count("datadog.tracer.traces_dropped", 1, []string{"reason:encoding_failed"}, 1)
-			log.Error("lost a trace: %v", err)
 			h.payload.Truncate(startLen)
-			return
+			return 0, &encodingError{cause: err, dropReason: "encoding_failed"}
 		}
-
 		if h.payload.Len() > payloadLimit-2 {
-			if i == 0 {
-				if !h.hasTraces {
-					// This is the first span of the first trace, and it's too big.
-					h.config.statsd.Count("datadog.tracer.traces_dropped", 1, []string{"reason:trace_too_large"}, 1)
-					log.Error("lost a trace: span too large for payload")
-					h.payload.Truncate(startLen)
-					return
-				}
+			if i == 0 && !h.hasTraces {
+				// This is the first span of the first trace, and it's too big.
 				h.payload.Truncate(startLen)
-				h.flush()
-			} else {
-				h.payload.Truncate(l)
-				h.payload.Write([]byte("]"))
-				h.hasTraces = true
-				h.flush()
+				return 0, &encodingError{cause: errors.New("span too large for payload"), dropReason: "trace_too_large"}
 			}
-			h.add(trace[i:])
-			return
+			h.payload.Truncate(l)
+			break
 		}
+		written++
 	}
 	h.payload.Write([]byte("]"))
 	h.hasTraces = true
+	return written, nil
+}
+
+func (h *lambdaTraceWriter) add(trace []*span) {
+	for len(trace) > 0 {
+		written, err := h.addTrace(trace)
+		if err != nil {
+			log.Error("lost a trace: %s", err.cause)
+			h.config.statsd.Count("datadog.tracer.traces_dropped", 1, []string{"reason:" + err.dropReason}, 1)
+			return
+		}
+		trace = trace[written:]
+		if len(trace) > 0 {
+			h.flush()
+		}
+	}
 }
 
 func (h *lambdaTraceWriter) stop() {}
