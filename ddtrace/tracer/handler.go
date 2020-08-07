@@ -191,7 +191,7 @@ func (h *lambdaTraceWriter) addTrace(trace []*span) (int, *encodingError) {
 			h.payload.Truncate(startLen)
 			return 0, &encodingError{cause: err, dropReason: "encoding_failed"}
 		}
-		if h.payload.Len() > payloadLimit-2 {
+		if h.payload.Len() > payloadLimit-3 {
 			if i == 0 && !h.hasTraces {
 				// This is the first span of the first trace, and it's too big.
 				h.payload.Truncate(startLen)
@@ -229,7 +229,7 @@ func (h *lambdaTraceWriter) flush() {
 	if !h.hasTraces {
 		return
 	}
-	h.payload.WriteString("]}")
+	h.payload.WriteString("]}\n")
 	os.Stdout.Write(h.payload.Bytes())
 	h.resetPayload()
 }
