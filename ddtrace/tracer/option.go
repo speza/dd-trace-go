@@ -148,6 +148,11 @@ func newConfig(opts ...StartOption) *config {
 			}
 		}
 	}
+	if _, ok := os.LookupEnv("AWS_LAMBDA_FUNCTION_NAME"); ok {
+		// AWS_LAMBDA_FUNCTION_NAME being set indicates that we're running in a lambda environment.
+		// See: https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
+		c.lambda = true
+	}
 	c.logStartup = internal.BoolEnv("DD_TRACE_STARTUP_LOGS", true)
 	c.runtimeMetrics = internal.BoolEnv("DD_RUNTIME_METRICS_ENABLED", false)
 	c.debug = internal.BoolEnv("DD_TRACE_DEBUG", false)
