@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -131,15 +132,15 @@ func newLambdaTraceWriter(c *config) *lambdaTraceWriter {
 	w := &lambdaTraceWriter{
 		config: c,
 	}
-	w.newPayload()
+	w.resetPayload()
 	return w
 }
 
 const payloadLimit = 256 * 1024 // log line limit for cloudwatch
 
-func (h *lambdaTraceWriter) newPayload() {
+func (h *lambdaTraceWriter) resetPayload() {
 	h.payload.Reset()
-	h.payload.Write([]byte(`{"traces": [`))
+	h.payload.WriteString(`{"traces": [`)
 	h.hasTraces = false
 }
 
@@ -175,9 +176,9 @@ type encodingError struct {
 func (h *lambdaTraceWriter) addTrace(trace []*span) (int, *encodingError) {
 	startLen := h.payload.Len()
 	if !h.hasTraces {
-		h.payload.Write([]byte("["))
+		h.payload.WriteByte('[')
 	} else {
-		h.payload.Write([]byte(", ["))
+		h.payload.WriteString(", [")
 	}
 	written := 0
 	for i, s := range trace {
@@ -201,7 +202,7 @@ func (h *lambdaTraceWriter) addTrace(trace []*span) (int, *encodingError) {
 		}
 		written++
 	}
-	h.payload.Write([]byte("]"))
+	h.payload.WriteString("]")
 	h.hasTraces = true
 	return written, nil
 }
@@ -228,7 +229,7 @@ func (h *lambdaTraceWriter) flush() {
 	if !h.hasTraces {
 		return
 	}
-	h.payload.Write([]byte("]}"))
-	log.Info("%s", h.payload.String())
-	h.newPayload()
+	h.payload.WriteString("]}")
+	os.Stdout.Write(h.payload.Bytes())
+	h.resetPayload()
 }
