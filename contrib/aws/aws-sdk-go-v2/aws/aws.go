@@ -48,37 +48,34 @@ func NewMiddleware(opts ...Option) *Middleware {
 // Append takes the API options from the aws.Config.
 func (mw *Middleware) Append(apiOptions *[]func(*middleware.Stack) error) {
 	*apiOptions = append(*apiOptions, func(stack *middleware.Stack) error {
+		// Add Initialize middleware before existing middleware so we start the span at the earliest point we can.
+		return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("TraceStart", mw.startTrace), middleware.Before)
+	})
+	*apiOptions = append(*apiOptions, func(stack *middleware.Stack) error {
 		// Add Initialize middleware after existing AWS middleware to make sure we can get details from the context.
-		// This also allows us to start the trace as early as possible.
-		return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("TraceInitialize", mw.initialize), middleware.After)
+		return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("TraceInit", mw.initTrace), middleware.After)
 	})
 	*apiOptions = append(*apiOptions, func(stack *middleware.Stack) error {
 		// Add Deserialize middleware to trace elements of the http request which is only built and sent at this point.
-		return stack.Deserialize.Add(middleware.DeserializeMiddlewareFunc("TraceDeserialize", mw.deserialize), middleware.Before)
+		return stack.Deserialize.Add(middleware.DeserializeMiddlewareFunc("TraceDeserialize", mw.deserializeTrace), middleware.Before)
 	})
 }
 
-func (mw *Middleware) initialize(
+func (mw *Middleware) startTrace(
 	ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler,
 ) (
 	out middleware.InitializeOutput, metadata middleware.Metadata, err error,
 ) {
-	region := awsmiddleware.GetRegion(ctx)
-	operation := awsmiddleware.GetOperationName(ctx)
-	serviceID := awsmiddleware.GetServiceID(ctx)
-
+	// Start a span with the minimum information possible.
+	// If we get a failure in the Init middleware, some context is better than none.
 	opts := []ddtrace.StartSpanOption{
 		tracer.SpanType(ext.SpanTypeHTTP),
-		tracer.ServiceName(serviceName(mw.cfg, serviceID)),
-		tracer.ResourceName(fmt.Sprintf("%s.%s", serviceID, operation)),
-		tracer.Tag(tagAWSRegion, region),
-		tracer.Tag(tagAWSOperation, operation),
-		tracer.Tag(tagAWSService, serviceID),
+		tracer.ServiceName(serviceName(mw.cfg, "")),
 	}
 	if !math.IsNaN(mw.cfg.analyticsRate) {
 		opts = append(opts, tracer.Tag(ext.EventSampleRate, mw.cfg.analyticsRate))
 	}
-	span, spanctx := tracer.StartSpanFromContext(ctx, fmt.Sprintf("%s.request", serviceID), opts...)
+	span, spanctx := tracer.StartSpanFromContext(ctx, "unknown.request", opts...)
 
 	// Handle Initialize and continue through the middleware chain.
 	out, metadata, err = next.HandleInitialize(spanctx, in)
@@ -91,7 +88,31 @@ func (mw *Middleware) initialize(
 	return out, metadata, err
 }
 
-func (mw *Middleware) deserialize(
+func (mw *Middleware) initTrace(
+	ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler,
+) (
+	out middleware.InitializeOutput, metadata middleware.Metadata, err error,
+) {
+	span, ok := tracer.SpanFromContext(ctx)
+	if !ok {
+		// If no span is found then we don't need to enrich the trace so just continue.
+		return next.HandleInitialize(ctx, in)
+	}
+
+	// As we run this middleware After other Initialize middlewares, we have access to more metadata.
+	operation := awsmiddleware.GetOperationName(ctx)
+	serviceID := awsmiddleware.GetServiceID(ctx)
+	span.SetTag(ext.ServiceName, serviceName(mw.cfg, serviceID))
+	span.SetTag(ext.SpanName, fmt.Sprintf("%s.request", serviceID))
+	span.SetTag(ext.ResourceName, fmt.Sprintf("%s.%s", serviceID, operation))
+	span.SetTag(tagAWSRegion, awsmiddleware.GetRegion(ctx))
+	span.SetTag(tagAWSOperation, awsmiddleware.GetOperationName(ctx))
+	span.SetTag(tagAWSService, serviceID)
+
+	return next.HandleInitialize(ctx, in)
+}
+
+func (mw *Middleware) deserializeTrace(
 	ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler,
 ) (
 	out middleware.DeserializeOutput, metadata middleware.Metadata, err error,
@@ -128,6 +149,10 @@ func (mw *Middleware) deserialize(
 func serviceName(cfg *config, serviceID string) string {
 	if cfg.serviceName != "" {
 		return cfg.serviceName
+	}
+
+	if serviceID == "" {
+		serviceID = "unknown"
 	}
 
 	return fmt.Sprintf("aws.%s", serviceID)
